@@ -7,7 +7,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from torch.utils.data import Dataset, DataLoader
-import random
 from itertools import pairwise
 
 def load_data(file_path):
@@ -106,10 +105,109 @@ class TemporalEmbedding(nn.Module):
         x = self.fc2(x)
         return x
 
-class AttentionEncoder(nn.Module):
-    """LSTM Encoder with Attention for trajectories"""
+class MultiHeadAttention(nn.Module):
+    """Multi-head self-attention mechanism"""
     
-    def __init__(self, num_users, embedding_dim=128, hidden_dim=256):
+    def __init__(self, embed_dim, num_heads, dropout=0.1):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        
+        assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
+        
+        self.query = nn.Linear(embed_dim, embed_dim)
+        self.key = nn.Linear(embed_dim, embed_dim)
+        self.value = nn.Linear(embed_dim, embed_dim)
+        self.dropout = nn.Dropout(dropout)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        
+    def forward(self, x, mask=None):
+        batch_size, seq_len, embed_dim = x.shape
+        
+        # Linear projections
+        Q = self.query(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        K = self.key(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        V = self.value(x).view(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        # Scaled dot-product attention
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        
+        if mask is not None:
+            mask = mask.unsqueeze(1).unsqueeze(1)  # Add head and query dimensions
+            scores.masked_fill_(mask == 0, -1e9)
+        
+        attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        
+        # Apply attention to values
+        attn_output = torch.matmul(attn_weights, V)
+        
+        # Concatenate heads and put through final linear layer
+        attn_output = attn_output.transpose(1, 2).contiguous().view(
+            batch_size, seq_len, embed_dim
+        )
+        output = self.out_proj(attn_output)
+        
+        return output, attn_weights.mean(dim=1)  # Average attention weights across heads
+
+class SpatialTemporalAttention(nn.Module):
+    """Cross-attention between spatial and temporal features"""
+    
+    def __init__(self, embed_dim, num_heads=4, dropout=0.1):
+        super().__init__()
+        self.spatial_temporal_attn = MultiHeadAttention(embed_dim, num_heads, dropout)
+        self.temporal_spatial_attn = MultiHeadAttention(embed_dim, num_heads, dropout)
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self.dropout = nn.Dropout(dropout)
+        
+    def forward(self, spatial_emb, temporal_emb, mask=None):
+        # Spatial attending to temporal
+        spatial_attended, _ = self.spatial_temporal_attn(
+            spatial_emb + temporal_emb, mask=mask
+        )
+        spatial_emb = self.norm1(spatial_emb + self.dropout(spatial_attended))
+        
+        # Temporal attending to spatial
+        temporal_attended, _ = self.temporal_spatial_attn(
+            temporal_emb + spatial_emb, mask=mask
+        )
+        temporal_emb = self.norm2(temporal_emb + self.dropout(temporal_attended))
+        
+        return spatial_emb, temporal_emb
+
+class TransformerBlock(nn.Module):
+    """Transformer block with multi-head self-attention and feed-forward network"""
+    
+    def __init__(self, embed_dim, num_heads, ff_dim, dropout=0.1):
+        super().__init__()
+        self.self_attention = MultiHeadAttention(embed_dim, num_heads, dropout)
+        self.feed_forward = nn.Sequential(
+            nn.Linear(embed_dim, ff_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(ff_dim, embed_dim),
+            nn.Dropout(dropout)
+        )
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        
+    def forward(self, x, mask=None):
+        # Self-attention with residual connection
+        attn_output, attn_weights = self.self_attention(x, mask)
+        x = self.norm1(x + attn_output)
+        
+        # Feed-forward with residual connection
+        ff_output = self.feed_forward(x)
+        x = self.norm2(x + ff_output)
+        
+        return x, attn_weights
+
+class HybridTransformerLSTMEncoder(nn.Module):
+    """Hybrid Transformer-LSTM Encoder with spatial-temporal attention"""
+    
+    def __init__(self, num_users, embedding_dim=128, hidden_dim=256, num_heads=8, num_layers=3, dropout=0.1):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.hidden_dim = hidden_dim
@@ -122,18 +220,30 @@ class AttentionEncoder(nn.Module):
         # Special tokens
         self.mask_token = nn.Parameter(torch.randn(embedding_dim))
         
-        # LSTM encoder
+        # Spatial-temporal cross-attention
+        self.spatial_temporal_attention = SpatialTemporalAttention(embedding_dim, num_heads=4, dropout=dropout)
+        
+        # Transformer blocks for sequential modeling
+        self.transformer_blocks = nn.ModuleList([
+            TransformerBlock(embedding_dim * 3, num_heads, embedding_dim * 4, dropout)
+            for _ in range(num_layers)
+        ])
+        
+        # LSTM for temporal sequence modeling
         self.lstm = nn.LSTM(
             input_size=embedding_dim * 3,  # user + spatial + temporal
             hidden_size=hidden_dim,
             num_layers=2,
-            dropout=0.2,
+            dropout=dropout if num_layers > 1 else 0,
             batch_first=True,
             bidirectional=True
         )
         
-        # Attention mechanism
-        self.attention = nn.Linear(hidden_dim * 2, 1)  # *2 for bidirectional
+        # Multi-head attention for final sequence aggregation
+        self.final_attention = MultiHeadAttention(hidden_dim * 2, num_heads=4, dropout=dropout)
+        
+        # Global attention mechanism for sequence-to-fixed
+        self.global_attention = nn.Linear(hidden_dim * 2, 1)
         
         # Output heads
         self.user_classifier = nn.Linear(hidden_dim * 2, num_users)
@@ -160,26 +270,42 @@ class AttentionEncoder(nn.Module):
         spatial_emb = self.spatial_embedding(coordinates)
         temporal_emb = self.temporal_embedding(timestamps)
         
-        # Combine embeddings
-        combined_emb = torch.cat([user_emb, spatial_emb, temporal_emb], dim=-1)
-        
-        # LSTM encoding
-        lstm_out, (hidden, cell) = self.lstm(combined_emb)
-        
-        # Attention mechanism
-        attention_weights = F.softmax(self.attention(lstm_out), dim=1)
-        
-        # Create mask for padding
-        padding_mask = torch.zeros(batch_size, seq_len, device=lstm_out.device)
+        # Create padding mask for attention
+        padding_mask = torch.zeros(batch_size, seq_len, device=user_ids.device)
         for i, length in enumerate(seq_lens):
             padding_mask[i, :length] = 1
         
-        # Apply padding mask to attention
-        attention_weights = attention_weights * padding_mask.unsqueeze(-1)
-        attention_weights = attention_weights / (attention_weights.sum(dim=1, keepdim=True) + 1e-8)
+        # Spatial-temporal cross-attention
+        spatial_emb, temporal_emb = self.spatial_temporal_attention(
+            spatial_emb, temporal_emb, mask=padding_mask
+        )
         
-        # Weighted sum
-        context_vector = torch.sum(attention_weights * lstm_out, dim=1)
+        # Combine embeddings
+        combined_emb = torch.cat([user_emb, spatial_emb, temporal_emb], dim=-1)
+        
+        # Pass through transformer blocks
+        transformer_out = combined_emb
+        all_attention_weights = []
+        
+        for transformer_block in self.transformer_blocks:
+            transformer_out, attn_weights = transformer_block(transformer_out, mask=padding_mask)
+            all_attention_weights.append(attn_weights)
+        
+        # LSTM encoding for temporal modeling
+        lstm_out, (hidden, cell) = self.lstm(transformer_out)
+        
+        # Final multi-head attention
+        attended_out, final_attn_weights = self.final_attention(lstm_out, mask=padding_mask)
+        
+        # Global attention mechanism for sequence-to-fixed
+        global_attention_weights = F.softmax(self.global_attention(attended_out), dim=1)
+        
+        # Apply padding mask to global attention
+        global_attention_weights = global_attention_weights * padding_mask.unsqueeze(-1)
+        global_attention_weights = global_attention_weights / (global_attention_weights.sum(dim=1, keepdim=True) + 1e-8)
+        
+        # Weighted sum for final representation
+        context_vector = torch.sum(global_attention_weights * attended_out, dim=1)
         
         # Predictions
         user_pred = self.user_classifier(context_vector)
@@ -189,16 +315,20 @@ class AttentionEncoder(nn.Module):
             'user_prediction': user_pred,
             'next_location_prediction': next_location_pred,
             'user_mask': user_mask,
-            'attention_weights': attention_weights,
+            'attention_weights': global_attention_weights,
+            'transformer_attention': all_attention_weights,
+            'final_attention': final_attn_weights,
             'context_vector': context_vector
         }
 
 class TrajectoryModel(nn.Module):
-    """Complete trajectory model with multi-task learning"""
+    """Complete trajectory model with hybrid transformer-LSTM architecture"""
     
-    def __init__(self, num_users, embedding_dim=128, hidden_dim=256):
+    def __init__(self, num_users, embedding_dim=128, hidden_dim=256, num_heads=8, num_layers=3, dropout=0.1):
         super().__init__()
-        self.encoder = AttentionEncoder(num_users, embedding_dim, hidden_dim)
+        self.encoder = HybridTransformerLSTMEncoder(
+            num_users, embedding_dim, hidden_dim, num_heads, num_layers, dropout
+        )
         
     def forward(self, batch, user_mask_prob=0.15):
         return self.encoder(
@@ -209,7 +339,7 @@ class TrajectoryModel(nn.Module):
             user_mask_prob
         )
     
-    def compute_loss(self, batch, outputs, alpha=1.0, beta=1.0):
+    def compute_loss(self, batch, outputs, alpha=1.0, beta=0.01):
         """Compute multi-task loss"""
         
         # User prediction loss (only on masked positions)
@@ -240,17 +370,13 @@ class TrajectoryModel(nn.Module):
         target_coords = torch.stack(target_coords)
         location_loss = F.mse_loss(outputs['next_location_prediction'], target_coords)
         
-        # Scale location loss down since coordinates are much larger than classification logits
-        # Option 1: Simple scaling - divide by 100 to match user loss magnitude
-        scaled_location_loss = location_loss / 1.0
-        
-        total_loss = alpha * user_loss + beta * scaled_location_loss
+        # Use location loss directly (scaling can be adjusted via beta parameter)
+        total_loss = alpha * user_loss + beta * location_loss
         
         return {
             'total_loss': total_loss,
             'user_loss': user_loss,
-            'location_loss': location_loss,
-            'scaled_location_loss': scaled_location_loss
+            'location_loss': location_loss
         }
 
 
@@ -259,11 +385,9 @@ def train_model(learning_rate=0.001, batch_size=32, num_epochs=5, patience=10,
                 subset_fraction=1.0, max_batches_per_epoch=None):
     """Training loop with convergence improvements"""
     
-    # Create sample data
-    print("Creating sample data...")
+    # Load data
+    print("Loading trajectory data...")
     trajectories = load_data("C:\\Users\\dlfel\\Projects\\python\\mobility\\data\\cityD-dataset.csv")
-    # with open('/content/drive/MyDrive/mobility/cityD-dataset.pkl', 'rb') as f:
-    #   trajectories = pickle.load(f)
     
     dataset = TrajectoryDataset(trajectories)  # num_users calculated automatically
     
@@ -341,7 +465,6 @@ def train_model(learning_rate=0.001, batch_size=32, num_epochs=5, patience=10,
                       f"Loss: {losses['total_loss']:.4f}, "
                       f"User Loss: {losses['user_loss']:.4f}, "
                       f"Location Loss: {losses['location_loss']:.4f}, "
-                      f"Scaled Location Loss: {losses['scaled_location_loss']:.4f}, "
                       f"LR: {current_lr:.6f}")
         
         avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
@@ -391,6 +514,18 @@ def load_trained_model(checkpoint_path):
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     return model, checkpoint
+
+def create_model_variants():
+    """Create different model variants for experimentation"""
+    variants = {
+        'light': TrajectoryModel(num_users=4000, embedding_dim=64, hidden_dim=128, 
+                                num_heads=4, num_layers=2, dropout=0.1),
+        'standard': TrajectoryModel(num_users=4000, embedding_dim=128, hidden_dim=256, 
+                                   num_heads=8, num_layers=3, dropout=0.1),
+        'heavy': TrajectoryModel(num_users=4000, embedding_dim=256, hidden_dim=512, 
+                                num_heads=16, num_layers=4, dropout=0.1)
+    }
+    return variants
 
 def embed_new_user(model, user_trajectories, method='mean'):
     """
@@ -560,8 +695,9 @@ def train_with_strategy(strategy='default'):
     - 'default': Standard training
     - 'conservative': Lower LR, smaller batch, more regularization
     - 'aggressive': Higher LR, larger batch, less regularization  
+    - 'fast_epochs': Use subset of data per epoch
+    - 'limited_batches': Limit batches per epoch
     - 'curriculum': Start with shorter sequences, gradually increase
-    - 'pretrain': Pre-train embeddings separately
     """
     
     if strategy == 'conservative':
