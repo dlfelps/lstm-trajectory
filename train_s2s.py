@@ -22,22 +22,28 @@ def load_data(file_path):
     temp = g.to_records(index=False).tolist()
     temp2 = list(map(lambda x: (x[0], x[3], x[4], is_weekend(x[1]), x[2]), temp))
     temp3 = pairwise(temp2)
-    temp4 = list(map(lambda x: (x[0][0], x[0][1], x[0][2], x[0][3], x[0][4], x[1][4]), temp3))
+    temp4 = list(map(lambda x: (x[0][0], x[0][1]/200, x[0][2]/200, x[0][3], x[0][4], x[1][4]), temp3))
     data.append(temp4)
   return data
 
 class TrajectoryDataset(Dataset):
-    """Dataset for trajectory sequences with user IDs"""
+    """Dataset for trajectory sequences with data augmentation"""
     
-    def __init__(self, trajectories, max_length=50):
+    def __init__(self, trajectories, max_length=50, noise_std=0.0, augment_prob=1.0, training=True):
         """
         trajectories: List of trajectories, each trajectory is:
         [(user_id, lat, lon, is_weekend, timestamp), (user_id, lat, lon, is_weekend, timestamp), ...]
         user_id should already be integer indices
+        noise_std: Standard deviation for Gaussian noise added to coordinates
+        augment_prob: Probability of applying augmentation to each trajectory
+        training: Whether dataset is used for training (enables augmentation)
         """
         self.trajectories = trajectories
         self.max_length = max_length
-        self.num_users = 4000    
+        self.num_users = 4000
+        self.noise_std = noise_std
+        self.augment_prob = augment_prob
+        self.training = training    
    
     def __len__(self):
         return len(self.trajectories)
@@ -45,35 +51,69 @@ class TrajectoryDataset(Dataset):
     def __getitem__(self, idx):
         traj = self.trajectories[idx]
         
+        # Need at least 2 points to have input + target
+        if len(traj) < 2:
+            # Skip trajectories that are too short
+            return self.__getitem__((idx + 1) % len(self.trajectories))
+        
         # Truncate or pad trajectory
         if len(traj) > self.max_length:
             traj = traj[:self.max_length]
         
-        # Convert to tensors
+        # Split into input sequence and target
+        input_traj = traj[:-1]  # All points except the last
+        target_point = traj[-1]   # Last point as target
+        
+        # Convert input sequence to tensors
         user_ids = []
         coordinates = []
         timestamps = []
         
-        for point in traj:
+        # Apply data augmentation if training and noise is enabled
+        apply_augmentation = (self.training and 
+                             self.noise_std > 0 and 
+                             torch.rand(1).item() < self.augment_prob)
+        
+        # Process input sequence (excluding target)
+        for point in input_traj:
             user_id, x, y, isw, timestamp, next_timestamp = point
             user_ids.append(user_id)  # user_id is already an integer index
-            coordinates.append([x, y])            
-            timestamps.append([isw,timestamp, next_timestamp])
+            
+            # Add Gaussian noise to coordinates if augmenting
+            if apply_augmentation:
+                noise_x = torch.normal(0, self.noise_std, size=(1,)).item()
+                noise_y = torch.normal(0, self.noise_std, size=(1,)).item()
+                x_noisy = x + noise_x
+                y_noisy = y + noise_y
+                coordinates.append([x_noisy, y_noisy])
+            else:
+                coordinates.append([x, y])
+                
+            timestamps.append([isw, timestamp, next_timestamp])
         
-        # Pad sequences
-        seq_len = len(traj)
+        # Extract target coordinates (no augmentation on target)
+        _, target_x, target_y, target_isw, target_timestamp, target_next_timestamp = target_point
+        target_coords = [target_x, target_y]
+        
+        # Pad input sequences
+        input_seq_len = len(input_traj)
         pad_token = self.num_users #not an actual user id
-        while len(user_ids) < self.max_length:
+        while len(user_ids) < self.max_length - 1:  # -1 because we removed target
             user_ids.append(pad_token)  # padding token
-            coordinates.append([201,201])
+            coordinates.append([1,1])
             timestamps.append([2,50, 50])
         
         return {
             'user_ids': torch.tensor(user_ids, dtype=torch.long),
             'coordinates': torch.tensor(coordinates, dtype=torch.float32),
             'timestamps': torch.tensor(timestamps, dtype=torch.float32),
-            'seq_len': torch.tensor(seq_len, dtype=torch.long)
+            'seq_len': torch.tensor(input_seq_len, dtype=torch.long),
+            'target_coords': torch.tensor(target_coords, dtype=torch.float32)
         }
+    
+    def set_training_mode(self, training):
+        """Set training mode to enable/disable augmentation"""
+        self.training = training
 
 class SpatialEmbedding(nn.Module):
     """Embed lat/lon coordinates"""
@@ -316,22 +356,14 @@ class TrajectoryModel(nn.Module):
         )
     
     def compute_loss(self, batch, outputs):
-        """Compute location prediction loss only"""
+        """Compute location prediction loss using proper targets"""
         
-        # Next location prediction loss - predict last coordinate in sequence
-        batch_size = batch['coordinates'].shape[0]
-        target_coords = []
-        for i in range(batch_size):
-            seq_len = batch['seq_len'][i]
-            if seq_len > 1:
-                # Use last coordinate as target
-                target_coords.append(batch['coordinates'][i, seq_len-1])
-            else:
-                # Fallback for short sequences
-                target_coords.append(batch['coordinates'][i, 0])
+        # Use the target coordinates from the dataset (not in input)
+        target_coords = batch['target_coords']  # Shape: [batch_size, 2]
+        predicted_coords = outputs['next_location_prediction']  # Shape: [batch_size, 2]
         
-        target_coords = torch.stack(target_coords)
-        location_loss = F.mse_loss(outputs['next_location_prediction'], target_coords)
+        # MSE loss between predicted and actual next locations
+        location_loss = F.mse_loss(predicted_coords, target_coords)
         
         return {
             'total_loss': location_loss,
@@ -341,14 +373,16 @@ class TrajectoryModel(nn.Module):
 
 def train_model(learning_rate=0.001, batch_size=32, num_epochs=5, patience=10, 
                 warmup_epochs=2, gradient_clip=1.0, weight_decay=1e-5,
-                subset_fraction=1.0, max_batches_per_epoch=None):
+                subset_fraction=1.0, max_batches_per_epoch=None,
+                noise_std=0.001, augment_prob=1.0):
     """Training loop with convergence improvements"""
     
     # Load data
     print("Loading trajectory data...")
     trajectories = load_data("C:\\Users\\dlfel\\Projects\\python\\mobility\\data\\cityD-dataset.csv")
     
-    dataset = TrajectoryDataset(trajectories)  # num_users calculated automatically
+    dataset = TrajectoryDataset(trajectories, noise_std=noise_std, 
+                               augment_prob=augment_prob, training=True)
     
     # Optionally use only a subset of the data
     if subset_fraction < 1.0:
@@ -377,6 +411,7 @@ def train_model(learning_rate=0.001, batch_size=32, num_epochs=5, patience=10,
     
     print(f"Training spatio-temporal model with {len(dataset)} trajectories")
     print(f"Batch size: {batch_size}, Learning rate: {learning_rate}")
+    print(f"Data augmentation: noise_std={noise_std}, augment_prob={augment_prob}")
     
     # Early stopping variables
     best_loss = float('inf')
@@ -485,6 +520,7 @@ def create_model_variants():
 def embed_trajectory(model, trajectory):
     """
     Create spatio-temporal embedding for any trajectory (works for unknown users)
+    Note: Uses the trajectory without the last point (since that would be the target)
     
     Args:
         model: trained TrajectoryModel
@@ -497,13 +533,15 @@ def embed_trajectory(model, trajectory):
     model.eval()
     
     with torch.no_grad():
-        # Convert trajectory to dataset format (user_id not used)
-        dataset = TrajectoryDataset([trajectory], max_length=50)
+        # Convert trajectory to dataset format (user_id not used, no augmentation)
+        # Dataset will automatically split into input (all but last) and target (last)
+        dataset = TrajectoryDataset([trajectory], max_length=50, training=False)
         batch = dataset[0]
         
         # Add batch dimension
         for key in batch:
-            batch[key] = batch[key].unsqueeze(0)
+            if key != 'target_coords':  # Don't add batch dim to target
+                batch[key] = batch[key].unsqueeze(0)
         
         # Forward pass through model
         outputs = model(batch)
@@ -521,17 +559,23 @@ def predict_next_location(model, trajectory):
     Returns:
         predicted_location: predicted (lat, lon) coordinates
         attention_weights: attention weights showing important trajectory parts
+        actual_target: the actual next location (if available, for comparison)
     """
     model.eval()
     
     with torch.no_grad():
-        # Convert trajectory to dataset format
-        dataset = TrajectoryDataset([trajectory], max_length=50)
+        # Convert trajectory to dataset format (no augmentation for inference)
+        # Dataset will automatically split into input (all but last) and target (last)
+        dataset = TrajectoryDataset([trajectory], max_length=50, training=False)
         batch = dataset[0]
+        
+        # Store actual target for comparison
+        actual_target = batch['target_coords'].clone()
         
         # Add batch dimension
         for key in batch:
-            batch[key] = batch[key].unsqueeze(0)
+            if key != 'target_coords':  # Don't add batch dim to target
+                batch[key] = batch[key].unsqueeze(0)
         
         # Forward pass through model
         outputs = model(batch)
@@ -539,7 +583,7 @@ def predict_next_location(model, trajectory):
         predicted_coords = outputs['next_location_prediction'].squeeze(0)
         attention_weights = outputs['attention_weights'].squeeze(0)
         
-        return predicted_coords, attention_weights
+        return predicted_coords, attention_weights, actual_target
 
 def find_similar_trajectories(model, query_trajectory, trajectory_database, top_k=5):
     """
@@ -593,25 +637,30 @@ def train_with_strategy(strategy='default'):
     if strategy == 'conservative':
         return train_model(
             learning_rate=0.0001,
-            batch_size=16, 
+            batch_size=16,             
+            subset_fraction=0.2,
             num_epochs=20,
             patience=15,
             gradient_clip=0.5,
-            weight_decay=1e-4
+            weight_decay=1e-4,
+            noise_std=0.05  # Light augmentation
         )
     elif strategy == 'aggressive':
         return train_model(
             learning_rate=0.01,
+            subset_fraction=0.2,
             batch_size=64,
             num_epochs=10,
             patience=5,
             gradient_clip=2.0,
-            weight_decay=1e-6
+            weight_decay=1e-6,
+            noise_std=0.2  # Heavier augmentation
         )
     elif strategy == 'fast_epochs':
         # Use only 20% of data per epoch, but more epochs
         return train_model(
             subset_fraction=0.2,
+            noise_std=0.2,
             num_epochs=25,
             patience=15
         )
@@ -621,50 +670,82 @@ def train_with_strategy(strategy='default'):
             max_batches_per_epoch=500,
             num_epochs=15
         )
-    elif strategy == 'curriculum':
-        # Start with shorter sequences
-        print("Phase 1: Training with max_length=20")
-        train_curriculum_phase(max_length=20, epochs=5)
-        print("Phase 2: Training with max_length=35") 
-        train_curriculum_phase(max_length=35, epochs=5)
-        print("Phase 3: Training with max_length=50")
-        return train_model(num_epochs=10)
+    elif strategy == 'high_augmentation':
+        # Strong augmentation to prevent overfitting
+        return train_model(
+            noise_std=0.5,  # Strong noise
+            weight_decay=1e-3,  # Strong regularization
+            num_epochs=15
+        )
     else:
         return train_model()
 
-def train_curriculum_phase(max_length, epochs):
-    """Helper for curriculum learning"""
+def train_minimal():
+    """Minimal training setup for quick convergence testing"""
+    print("Starting minimal training for convergence testing...")
+    
+    # Create minimal model manually
     trajectories = load_data("C:\\Users\\dlfel\\Projects\\python\\mobility\\data\\cityD-dataset.csv")
-    dataset = TrajectoryDataset(trajectories, max_length=max_length)
-    dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+    dataset = TrajectoryDataset(trajectories, noise_std=0.0, training=True)
     
-    model = TrajectoryModel()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
+    # Use only 10% of data for speed
+    subset_size = int(len(dataset) * 0.1)
+    indices = torch.randperm(len(dataset))[:subset_size]
+    dataset = torch.utils.data.Subset(dataset, indices)
     
-    for epoch in range(epochs):
+    dataloader = DataLoader(dataset, batch_size=64, shuffle=True)
+    
+    # Create minimal model
+    model = TrajectoryModel(embedding_dim=32, hidden_dim=64, num_heads=2, num_layers=1, dropout=0.1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01, weight_decay=1e-5)
+    
+    print(f"Minimal training with {len(dataset)} trajectories")
+    print("Model: 32-dim embeddings, 64-dim hidden, 2 heads, 1 layer")
+    
+    # Simple training loop
+    model.train()
+    for epoch in range(10):
         total_loss = 0
+        num_batches = 0
+        
         for batch_idx, batch in enumerate(dataloader):
             optimizer.zero_grad()
+            
+            # Forward pass
             outputs = model(batch)
             losses = model.compute_loss(batch, outputs)
+            
+            # Backward pass
             losses['total_loss'].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
+            
             total_loss += losses['total_loss'].item()
+            num_batches += 1
+            
+            if batch_idx % 50 == 0:
+                print(f"Epoch {epoch}, Batch {batch_idx}, Loss: {losses['total_loss']:.6f}")
         
-        print(f"Curriculum Phase - Epoch {epoch}, Avg Loss: {total_loss/len(dataloader):.4f}")
+        avg_loss = total_loss / num_batches
+        print(f"Epoch {epoch} completed, Average Loss: {avg_loss:.6f}")
+        
+        # Save checkpoint
+        torch.save(model.state_dict(), f'minimal_model_epoch_{epoch}.pth')
+    
+    print("Minimal training completed!")
 
 if __name__ == "__main__":
     # Choose training strategy based on your needs:
     # train_with_strategy('default')        # Standard training
     # train_with_strategy('conservative')   # If loss explodes or doesn't decrease
     # train_with_strategy('aggressive')     # If training is too slow
-    # train_with_strategy('curriculum')     # If model struggles with long sequences
-    train_with_strategy('fast_epochs')    # Use 20% of data per epoch (faster epochs)
-    # train_with_strategy('limited_batches') # Limit to 500 batches per epoch
+    # train_with_strategy('fast_epochs')      # Use 20% of data per epoch (faster epochs)
+    # train_with_strategy('limited_batches')   # Limit to 500 batches per epoch  
+    # train_with_strategy('high_augmentation') # Strong augmentation for overfitting
+    
+    # Minimal training for convergence testing
+    train_minimal()  # Fast test with small model
     
     # Or use custom parameters:
-    # train_model(subset_fraction=0.1, max_batches_per_epoch=100)  # Very fast epochs
+    # train_model(noise_std=0.002, augment_prob=0.6)  # Custom augmentation
     # train_model(subset_fraction=0.5)  # Use 50% of data
-    
-    # train_model()
