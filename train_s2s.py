@@ -205,33 +205,29 @@ class TransformerBlock(nn.Module):
         return x, attn_weights
 
 class HybridTransformerLSTMEncoder(nn.Module):
-    """Hybrid Transformer-LSTM Encoder with spatial-temporal attention"""
+    """Simplified Hybrid Transformer-LSTM Encoder for spatio-temporal modeling"""
     
-    def __init__(self, num_users, embedding_dim=128, hidden_dim=256, num_heads=8, num_layers=3, dropout=0.1):
+    def __init__(self, embedding_dim=128, hidden_dim=256, num_heads=8, num_layers=3, dropout=0.1):
         super().__init__()
         self.embedding_dim = embedding_dim
         self.hidden_dim = hidden_dim
         
-        # Embedding layers
-        self.user_embedding = nn.Embedding(num_users + 1, embedding_dim)  # +1 for padding
+        # Only spatial and temporal embeddings
         self.spatial_embedding = SpatialEmbedding(embedding_dim=embedding_dim)
         self.temporal_embedding = TemporalEmbedding(embedding_dim=embedding_dim)
-        
-        # Special tokens
-        self.mask_token = nn.Parameter(torch.randn(embedding_dim))
         
         # Spatial-temporal cross-attention
         self.spatial_temporal_attention = SpatialTemporalAttention(embedding_dim, num_heads=4, dropout=dropout)
         
-        # Transformer blocks for sequential modeling
+        # Transformer blocks for sequential modeling (spatial + temporal only)
         self.transformer_blocks = nn.ModuleList([
-            TransformerBlock(embedding_dim * 3, num_heads, embedding_dim * 4, dropout)
+            TransformerBlock(embedding_dim * 2, num_heads, embedding_dim * 4, dropout)
             for _ in range(num_layers)
         ])
         
         # LSTM for temporal sequence modeling
         self.lstm = nn.LSTM(
-            input_size=embedding_dim * 3,  # user + spatial + temporal
+            input_size=embedding_dim * 2,  # spatial + temporal only
             hidden_size=hidden_dim,
             num_layers=2,
             dropout=dropout if num_layers > 1 else 0,
@@ -245,33 +241,18 @@ class HybridTransformerLSTMEncoder(nn.Module):
         # Global attention mechanism for sequence-to-fixed
         self.global_attention = nn.Linear(hidden_dim * 2, 1)
         
-        # Output heads
-        self.user_classifier = nn.Linear(hidden_dim * 2, num_users)
+        # Only location prediction head
         self.next_location_predictor = nn.Linear(hidden_dim * 2, 2)  # lat, lon
         
-    def forward(self, user_ids, coordinates, timestamps, seq_lens, user_mask_prob=0.15):
-        batch_size, seq_len = user_ids.shape
+    def forward(self, coordinates, timestamps, seq_lens):
+        batch_size, seq_len = coordinates.shape[0], coordinates.shape[1]
         
-        # Create user mask for training
-        user_mask = torch.zeros_like(user_ids, dtype=torch.bool)
-        if self.training:
-            # Randomly mask user_ids
-            mask_indices = torch.rand(batch_size, seq_len) < user_mask_prob
-            # Don't mask padding tokens
-            for i, length in enumerate(seq_lens):
-                mask_indices[i, length:] = False
-            user_mask = mask_indices
-        
-        # Get embeddings
-        user_emb = self.user_embedding(user_ids)
-        # Apply masking
-        user_emb[user_mask] = self.mask_token
-        
+        # Get only spatial and temporal embeddings
         spatial_emb = self.spatial_embedding(coordinates)
         temporal_emb = self.temporal_embedding(timestamps)
         
         # Create padding mask for attention
-        padding_mask = torch.zeros(batch_size, seq_len, device=user_ids.device)
+        padding_mask = torch.zeros(batch_size, seq_len, device=coordinates.device)
         for i, length in enumerate(seq_lens):
             padding_mask[i, :length] = 1
         
@@ -280,8 +261,8 @@ class HybridTransformerLSTMEncoder(nn.Module):
             spatial_emb, temporal_emb, mask=padding_mask
         )
         
-        # Combine embeddings
-        combined_emb = torch.cat([user_emb, spatial_emb, temporal_emb], dim=-1)
+        # Combine embeddings (only spatial + temporal)
+        combined_emb = torch.cat([spatial_emb, temporal_emb], dim=-1)
         
         # Pass through transformer blocks
         transformer_out = combined_emb
@@ -307,14 +288,11 @@ class HybridTransformerLSTMEncoder(nn.Module):
         # Weighted sum for final representation
         context_vector = torch.sum(global_attention_weights * attended_out, dim=1)
         
-        # Predictions
-        user_pred = self.user_classifier(context_vector)
+        # Only location prediction
         next_location_pred = self.next_location_predictor(context_vector)
         
         return {
-            'user_prediction': user_pred,
             'next_location_prediction': next_location_pred,
-            'user_mask': user_mask,
             'attention_weights': global_attention_weights,
             'transformer_attention': all_attention_weights,
             'final_attention': final_attn_weights,
@@ -322,40 +300,25 @@ class HybridTransformerLSTMEncoder(nn.Module):
         }
 
 class TrajectoryModel(nn.Module):
-    """Complete trajectory model with hybrid transformer-LSTM architecture"""
+    """Simplified trajectory model for spatio-temporal location prediction"""
     
-    def __init__(self, num_users, embedding_dim=128, hidden_dim=256, num_heads=8, num_layers=3, dropout=0.1):
+    def __init__(self, embedding_dim=128, hidden_dim=256, num_heads=8, num_layers=3, dropout=0.1):
         super().__init__()
         self.encoder = HybridTransformerLSTMEncoder(
-            num_users, embedding_dim, hidden_dim, num_heads, num_layers, dropout
+            embedding_dim, hidden_dim, num_heads, num_layers, dropout
         )
         
-    def forward(self, batch, user_mask_prob=0.15):
+    def forward(self, batch):
         return self.encoder(
-            batch['user_ids'],
             batch['coordinates'], 
             batch['timestamps'],
-            batch['seq_len'],
-            user_mask_prob
+            batch['seq_len']
         )
     
-    def compute_loss(self, batch, outputs, alpha=1.0, beta=0.01):
-        """Compute multi-task loss"""
+    def compute_loss(self, batch, outputs):
+        """Compute location prediction loss only"""
         
-        # User prediction loss (only on masked positions)
-        user_mask = outputs['user_mask']
-        if user_mask.sum() > 0:
-            masked_user_ids = batch['user_ids'][user_mask]
-            # Get predictions for each position, then select masked ones
-            batch_size, seq_len = user_mask.shape
-            user_preds_expanded = outputs['user_prediction'].unsqueeze(1).expand(-1, seq_len, -1)
-            masked_user_preds = user_preds_expanded[user_mask]
-            user_loss = F.cross_entropy(masked_user_preds, masked_user_ids)
-        else:
-            user_loss = torch.tensor(0.0, device=batch['user_ids'].device)
-        
-        # Next location prediction loss (simplified - predict last coordinate)
-        # In practice, you'd want to predict next location given previous sequence
+        # Next location prediction loss - predict last coordinate in sequence
         batch_size = batch['coordinates'].shape[0]
         target_coords = []
         for i in range(batch_size):
@@ -370,12 +333,8 @@ class TrajectoryModel(nn.Module):
         target_coords = torch.stack(target_coords)
         location_loss = F.mse_loss(outputs['next_location_prediction'], target_coords)
         
-        # Use location loss directly (scaling can be adjusted via beta parameter)
-        total_loss = alpha * user_loss + beta * location_loss
-        
         return {
-            'total_loss': total_loss,
-            'user_loss': user_loss,
+            'total_loss': location_loss,
             'location_loss': location_loss
         }
 
@@ -400,8 +359,8 @@ def train_model(learning_rate=0.001, batch_size=32, num_epochs=5, patience=10,
     
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
     
-    # Initialize model
-    model = TrajectoryModel(num_users=4000)
+    # Initialize model (no user-specific parameters needed)
+    model = TrajectoryModel()
     
     # Improved optimizer with weight decay
     optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
@@ -416,7 +375,7 @@ def train_model(learning_rate=0.001, batch_size=32, num_epochs=5, patience=10,
         optimizer, start_factor=0.1, total_iters=warmup_epochs
     )
     
-    print(f"Training with 4000 users, {len(dataset)} trajectories")
+    print(f"Training spatio-temporal model with {len(dataset)} trajectories")
     print(f"Batch size: {batch_size}, Learning rate: {learning_rate}")
     
     # Early stopping variables
@@ -438,7 +397,7 @@ def train_model(learning_rate=0.001, batch_size=32, num_epochs=5, patience=10,
             optimizer.zero_grad()
             
             # Forward pass
-            outputs = model(batch, user_mask_prob=0.15)
+            outputs = model(batch)
             
             # Compute loss
             losses = model.compute_loss(batch, outputs)
@@ -462,8 +421,6 @@ def train_model(learning_rate=0.001, batch_size=32, num_epochs=5, patience=10,
             if batch_idx % 100 == 0:
                 current_lr = optimizer.param_groups[0]['lr']
                 print(f"Epoch {epoch}, Batch {batch_idx}/{len(dataloader)}, "
-                      f"Loss: {losses['total_loss']:.4f}, "
-                      f"User Loss: {losses['user_loss']:.4f}, "
                       f"Location Loss: {losses['location_loss']:.4f}, "
                       f"LR: {current_lr:.6f}")
         
@@ -486,7 +443,6 @@ def train_model(learning_rate=0.001, batch_size=32, num_epochs=5, patience=10,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'loss': avg_loss,
-                'num_users': 4000
             }
             torch.save(best_checkpoint, 'best_model.pth')
         else:
@@ -501,8 +457,7 @@ def train_model(learning_rate=0.001, batch_size=32, num_epochs=5, patience=10,
             'epoch': epoch,
             'model_state_dict': model.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
-            'loss': total_loss/len(dataloader),
-            'num_users': 4000
+            'loss': total_loss/len(dataloader)
         }
         torch.save(checkpoint, f'model_epoch_{epoch}.pth')
         print(f"Model saved as model_epoch_{epoch}.pth")
@@ -510,7 +465,7 @@ def train_model(learning_rate=0.001, batch_size=32, num_epochs=5, patience=10,
 def load_trained_model(checkpoint_path):
     """Load a trained model from checkpoint"""
     checkpoint = torch.load(checkpoint_path)
-    model = TrajectoryModel(num_users=checkpoint['num_users'])
+    model = TrajectoryModel()
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     return model, checkpoint
@@ -518,87 +473,22 @@ def load_trained_model(checkpoint_path):
 def create_model_variants():
     """Create different model variants for experimentation"""
     variants = {
-        'light': TrajectoryModel(num_users=4000, embedding_dim=64, hidden_dim=128, 
+        'light': TrajectoryModel(embedding_dim=64, hidden_dim=128, 
                                 num_heads=4, num_layers=2, dropout=0.1),
-        'standard': TrajectoryModel(num_users=4000, embedding_dim=128, hidden_dim=256, 
+        'standard': TrajectoryModel(embedding_dim=128, hidden_dim=256, 
                                    num_heads=8, num_layers=3, dropout=0.1),
-        'heavy': TrajectoryModel(num_users=4000, embedding_dim=256, hidden_dim=512, 
+        'heavy': TrajectoryModel(embedding_dim=256, hidden_dim=512, 
                                 num_heads=16, num_layers=4, dropout=0.1)
     }
     return variants
 
-def embed_new_user(model, user_trajectories, method='mean'):
+def embed_trajectory(model, trajectory):
     """
-    Project a new user into the embedding space using their trajectories
-    
-    Args:
-        model: trained TrajectoryModel
-        user_trajectories: list of trajectories for the new user
-        method: 'mean' or 'attention' - how to aggregate trajectory embeddings
-    
-    Returns:
-        user_embedding: tensor of shape [embedding_dim]
-    """
-    model.eval()
-    trajectory_embeddings = []
-    
-    with torch.no_grad():
-        for traj in user_trajectories:
-            # Create a dummy dataset with just this trajectory
-            # Replace user_id with a placeholder (we'll ignore user embeddings)
-            traj_with_dummy_user = [(0, *point[1:]) for point in traj]
-            
-            # Convert to tensor format
-            dataset = TrajectoryDataset([traj_with_dummy_user], max_length=50)
-            batch = dataset[0]
-            
-            # Add batch dimension
-            for key in batch:
-                batch[key] = batch[key].unsqueeze(0)
-            
-            # Get spatial and temporal embeddings (ignore user embeddings for new user)
-            spatial_emb = model.encoder.spatial_embedding(batch['coordinates'])
-            temporal_emb = model.encoder.temporal_embedding(batch['timestamps'])
-            
-            # Combine spatial and temporal only
-            combined_emb = torch.cat([spatial_emb, temporal_emb], dim=-1)
-            
-            # Pass through LSTM
-            lstm_out, _ = model.encoder.lstm(combined_emb)
-            
-            # Apply attention to get trajectory representation
-            attention_weights = F.softmax(model.encoder.attention(lstm_out), dim=1)
-            seq_len = batch['seq_len'].item()
-            
-            # Mask padding
-            padding_mask = torch.zeros(1, lstm_out.shape[1])
-            padding_mask[0, :seq_len] = 1
-            attention_weights = attention_weights * padding_mask.unsqueeze(-1)
-            attention_weights = attention_weights / (attention_weights.sum(dim=1, keepdim=True) + 1e-8)
-            
-            # Get trajectory embedding
-            traj_embedding = torch.sum(attention_weights * lstm_out, dim=1)
-            trajectory_embeddings.append(traj_embedding.squeeze(0))
-    
-    # Aggregate trajectory embeddings
-    if method == 'mean':
-        user_embedding = torch.stack(trajectory_embeddings).mean(dim=0)
-    elif method == 'attention':
-        # Use learned attention to weight trajectory embeddings
-        embeddings_stack = torch.stack(trajectory_embeddings)
-        weights = F.softmax(torch.randn(len(trajectory_embeddings)), dim=0)
-        user_embedding = torch.sum(weights.unsqueeze(-1) * embeddings_stack, dim=0)
-    
-    return user_embedding
-
-def embed_trajectory(model, trajectory, user_embedding=None):
-    """
-    Project a trajectory into the embedding space
+    Create spatio-temporal embedding for any trajectory (works for unknown users)
     
     Args:
         model: trained TrajectoryModel
         trajectory: single trajectory to embed
-        user_embedding: optional user embedding to use instead of learned user embeddings
     
     Returns:
         trajectory_embedding: tensor of shape [hidden_dim*2]
@@ -607,80 +497,80 @@ def embed_trajectory(model, trajectory, user_embedding=None):
     model.eval()
     
     with torch.no_grad():
-        # Prepare trajectory data
-        if user_embedding is not None:
-            # Use provided user embedding
-            traj_with_dummy_user = [(0, *point[1:]) for point in trajectory]
-        else:
-            # Use original user IDs
-            traj_with_dummy_user = trajectory
-            
-        dataset = TrajectoryDataset([traj_with_dummy_user], max_length=50)
+        # Convert trajectory to dataset format (user_id not used)
+        dataset = TrajectoryDataset([trajectory], max_length=50)
         batch = dataset[0]
         
         # Add batch dimension
         for key in batch:
             batch[key] = batch[key].unsqueeze(0)
         
-        if user_embedding is not None:
-            # Replace user embeddings with provided embedding
-            spatial_emb = model.encoder.spatial_embedding(batch['coordinates'])
-            temporal_emb = model.encoder.temporal_embedding(batch['timestamps'])
-            
-            # Repeat user embedding for sequence length
-            seq_len = batch['coordinates'].shape[1]
-            user_emb = user_embedding.unsqueeze(0).unsqueeze(0).repeat(1, seq_len, 1)
-            
-            combined_emb = torch.cat([user_emb, spatial_emb, temporal_emb], dim=-1)
-        else:
-            # Use model's forward pass
-            outputs = model(batch, user_mask_prob=0.0)  # No masking for inference
-            return outputs['context_vector'].squeeze(0), outputs['attention_weights'].squeeze(0)
+        # Forward pass through model
+        outputs = model(batch)
         
-        # Continue with LSTM and attention
-        lstm_out, _ = model.encoder.lstm(combined_emb)
-        attention_weights = F.softmax(model.encoder.attention(lstm_out), dim=1)
-        
-        # Apply sequence length mask
-        seq_len = batch['seq_len'].item()
-        padding_mask = torch.zeros(1, lstm_out.shape[1])
-        padding_mask[0, :seq_len] = 1
-        attention_weights = attention_weights * padding_mask.unsqueeze(-1)
-        attention_weights = attention_weights / (attention_weights.sum(dim=1, keepdim=True) + 1e-8)
-        
-        # Get trajectory embedding
-        trajectory_embedding = torch.sum(attention_weights * lstm_out, dim=1)
-        
-        return trajectory_embedding.squeeze(0), attention_weights.squeeze(0)
+        return outputs['context_vector'].squeeze(0), outputs['attention_weights'].squeeze(0)
 
-def find_similar_users(model, new_user_embedding, existing_user_ids, top_k=5):
+def predict_next_location(model, trajectory):
     """
-    Find most similar existing users to a new user
+    Predict next location for any trajectory (works for unknown users)
+    
+    Args:
+        model: trained TrajectoryModel
+        trajectory: trajectory to predict next location for
+    
+    Returns:
+        predicted_location: predicted (lat, lon) coordinates
+        attention_weights: attention weights showing important trajectory parts
+    """
+    model.eval()
+    
+    with torch.no_grad():
+        # Convert trajectory to dataset format
+        dataset = TrajectoryDataset([trajectory], max_length=50)
+        batch = dataset[0]
+        
+        # Add batch dimension
+        for key in batch:
+            batch[key] = batch[key].unsqueeze(0)
+        
+        # Forward pass through model
+        outputs = model(batch)
+        
+        predicted_coords = outputs['next_location_prediction'].squeeze(0)
+        attention_weights = outputs['attention_weights'].squeeze(0)
+        
+        return predicted_coords, attention_weights
+
+def find_similar_trajectories(model, query_trajectory, trajectory_database, top_k=5):
+    """
+    Find most similar trajectories based on spatio-temporal embeddings
     
     Args:
         model: trained model
-        new_user_embedding: embedding of new user
-        existing_user_ids: list of existing user IDs
-        top_k: number of similar users to return
+        query_trajectory: trajectory to find similar ones for
+        trajectory_database: list of trajectories to search through
+        top_k: number of similar trajectories to return
     
     Returns:
-        similar_users: list of (user_id, similarity_score) tuples
+        similar_trajectories: list of (trajectory_index, similarity_score) tuples
     """
+    # Get embedding for query trajectory
+    query_embedding, _ = embed_trajectory(model, query_trajectory)
+    
     similarities = []
     
-    with torch.no_grad():
-        for user_id in existing_user_ids:
-            # Get existing user embedding
-            existing_embedding = model.encoder.user_embedding(torch.tensor([user_id]))
-            
-            # Compute cosine similarity
-            similarity = F.cosine_similarity(
-                new_user_embedding.unsqueeze(0), 
-                existing_embedding, 
-                dim=1
-            ).item()
-            
-            similarities.append((user_id, similarity))
+    for i, traj in enumerate(trajectory_database):
+        # Get embedding for database trajectory
+        db_embedding, _ = embed_trajectory(model, traj)
+        
+        # Compute cosine similarity
+        similarity = F.cosine_similarity(
+            query_embedding.unsqueeze(0), 
+            db_embedding.unsqueeze(0), 
+            dim=1
+        ).item()
+        
+        similarities.append((i, similarity))
     
     # Sort by similarity and return top k
     similarities.sort(key=lambda x: x[1], reverse=True)
@@ -748,14 +638,14 @@ def train_curriculum_phase(max_length, epochs):
     dataset = TrajectoryDataset(trajectories, max_length=max_length)
     dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
     
-    model = TrajectoryModel(num_users=4000)
+    model = TrajectoryModel()
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
     
     for epoch in range(epochs):
         total_loss = 0
         for batch_idx, batch in enumerate(dataloader):
             optimizer.zero_grad()
-            outputs = model(batch, user_mask_prob=0.15)
+            outputs = model(batch)
             losses = model.compute_loss(batch, outputs)
             losses['total_loss'].backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
