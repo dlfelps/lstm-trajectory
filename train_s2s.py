@@ -19,6 +19,8 @@ def load_data(file_path):
   df = df[df['uid'] < 4000]
   data = []
   for _, g in df.groupby(['uid', 'd']):
+    if len(g) < 2:
+        continue
     temp = g.to_records(index=False).tolist()
     temp2 = list(map(lambda x: (x[0], x[3], x[4], is_weekend(x[1]), x[2]), temp))
     temp3 = pairwise(temp2)
@@ -50,11 +52,6 @@ class TrajectoryDataset(Dataset):
     
     def __getitem__(self, idx):
         traj = self.trajectories[idx]
-        
-        # Need at least 2 points to have input + target
-        if len(traj) < 2:
-            # Skip trajectories that are too short
-            return self.__getitem__((idx + 1) % len(self.trajectories))
         
         # Truncate or pad trajectory
         if len(traj) > self.max_length:
@@ -371,10 +368,10 @@ class TrajectoryModel(nn.Module):
         }
 
 
-def train_model(learning_rate=0.001, batch_size=32, num_epochs=5, patience=10, 
+def train_model(learning_rate=0.0001, batch_size=32, num_epochs=5, patience=10, 
                 warmup_epochs=2, gradient_clip=1.0, weight_decay=1e-5,
-                subset_fraction=1.0, max_batches_per_epoch=None,
-                noise_std=0.001, augment_prob=1.0):
+                subset_fraction=0.25, max_batches_per_epoch=None,
+                noise_std=0.0001, augment_prob=1.0):
     """Training loop with convergence improvements"""
     
     # Load data
@@ -504,18 +501,6 @@ def load_trained_model(checkpoint_path):
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     return model, checkpoint
-
-def create_model_variants():
-    """Create different model variants for experimentation"""
-    variants = {
-        'light': TrajectoryModel(embedding_dim=64, hidden_dim=128, 
-                                num_heads=4, num_layers=2, dropout=0.1),
-        'standard': TrajectoryModel(embedding_dim=128, hidden_dim=256, 
-                                   num_heads=8, num_layers=3, dropout=0.1),
-        'heavy': TrajectoryModel(embedding_dim=256, hidden_dim=512, 
-                                num_heads=16, num_layers=4, dropout=0.1)
-    }
-    return variants
 
 def embed_trajectory(model, trajectory):
     """
@@ -680,63 +665,11 @@ def train_with_strategy(strategy='default'):
     else:
         return train_model()
 
-def train_minimal():
-    """Minimal training setup for quick convergence testing"""
-    print("Starting minimal training for convergence testing...")
-    
-    # Create minimal model manually
-    trajectories = load_data("C:\\Users\\dlfel\\Projects\\python\\mobility\\data\\cityD-dataset.csv")
-    dataset = TrajectoryDataset(trajectories, noise_std=0.0, training=True)
-    
-    # Use only 10% of data for speed
-    subset_size = int(len(dataset) * 0.1)
-    indices = torch.randperm(len(dataset))[:subset_size]
-    dataset = torch.utils.data.Subset(dataset, indices)
-    
-    dataloader = DataLoader(dataset, batch_size=64, shuffle=True)
-    
-    # Create minimal model
-    model = TrajectoryModel(embedding_dim=32, hidden_dim=64, num_heads=2, num_layers=1, dropout=0.1)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.01, weight_decay=1e-5)
-    
-    print(f"Minimal training with {len(dataset)} trajectories")
-    print("Model: 32-dim embeddings, 64-dim hidden, 2 heads, 1 layer")
-    
-    # Simple training loop
-    model.train()
-    for epoch in range(10):
-        total_loss = 0
-        num_batches = 0
-        
-        for batch_idx, batch in enumerate(dataloader):
-            optimizer.zero_grad()
-            
-            # Forward pass
-            outputs = model(batch)
-            losses = model.compute_loss(batch, outputs)
-            
-            # Backward pass
-            losses['total_loss'].backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-            
-            total_loss += losses['total_loss'].item()
-            num_batches += 1
-            
-            if batch_idx % 50 == 0:
-                print(f"Epoch {epoch}, Batch {batch_idx}, Loss: {losses['total_loss']:.6f}")
-        
-        avg_loss = total_loss / num_batches
-        print(f"Epoch {epoch} completed, Average Loss: {avg_loss:.6f}")
-        
-        # Save checkpoint
-        torch.save(model.state_dict(), f'minimal_model_epoch_{epoch}.pth')
-    
-    print("Minimal training completed!")
+
 
 if __name__ == "__main__":
     # Choose training strategy based on your needs:
-    # train_with_strategy('default')        # Standard training
+    train_with_strategy('default')        # Standard training
     # train_with_strategy('conservative')   # If loss explodes or doesn't decrease
     # train_with_strategy('aggressive')     # If training is too slow
     # train_with_strategy('fast_epochs')      # Use 20% of data per epoch (faster epochs)
@@ -744,7 +677,6 @@ if __name__ == "__main__":
     # train_with_strategy('high_augmentation') # Strong augmentation for overfitting
     
     # Minimal training for convergence testing
-    train_minimal()  # Fast test with small model
     
     # Or use custom parameters:
     # train_model(noise_std=0.002, augment_prob=0.6)  # Custom augmentation

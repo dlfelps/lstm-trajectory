@@ -12,4 +12,5 @@ wheels/
 # other
 data/
 precomputed/
+results/
 *.pth
