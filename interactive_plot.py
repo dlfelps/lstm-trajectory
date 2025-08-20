@@ -56,13 +56,20 @@ def create_interactive_app():
         ], style={'width': '70%', 'display': 'inline-block', 'verticalAlign': 'top'}),
         
         html.Div([
-            html.H3("Selected Points Information"),
+            html.H3("Trajectory Heatmap"),
+            dcc.Graph(
+                id='trajectory-heatmap',
+                config={'displayModeBar': True},
+                style={'height': '400px', 'border': '1px solid #ddd', 'borderRadius': '5px'}
+            ),
+            
+            html.H3("Selected Points Information", style={'marginTop': '20px'}),
             html.Div(id='selection-info', 
                     style={'border': '1px solid #ddd', 
                            'padding': '20px', 
                            'borderRadius': '5px',
                            'backgroundColor': '#f9f9f9',
-                           'minHeight': '400px',
+                           'minHeight': '200px',
                            'fontFamily': 'monospace'})
         ], style={'width': '28%', 'display': 'inline-block', 'verticalAlign': 'top', 'marginLeft': '2%'})
     ])
@@ -99,7 +106,77 @@ def create_interactive_app():
         
         return fig
     
-    # Callback for handling point selection
+    # Callback for updating trajectory heatmap
+    @app.callback(
+        Output('trajectory-heatmap', 'figure'),
+        Input('pca-scatter', 'selectedData')
+    )
+    def update_trajectory_heatmap(selectedData):
+        if selectedData is None or len(selectedData['points']) == 0:
+            # Return empty heatmap placeholder
+            fig = go.Figure()
+            fig.add_annotation(
+                x=0.5, y=0.5,
+                text="Select points in the scatter plot<br>to see trajectory heatmap",
+                showarrow=False,
+                xref="paper", yref="paper",
+                font=dict(size=14, color="gray")
+            )
+            fig.update_layout(
+                title="Trajectory Heatmap",
+                xaxis=dict(showgrid=False, showticklabels=False, zeroline=False),
+                yaxis=dict(showgrid=False, showticklabels=False, zeroline=False),
+                plot_bgcolor='white',
+                height=400
+            )
+            return fig
+        
+        # Get selected point indices
+        point_indices = [point['pointIndex'] for point in selectedData['points']]
+        
+        # TODO: Replace this placeholder with your heatmap code
+        # For now, create a simple placeholder heatmap
+        selected_trajs = [traj[i] for i in point_indices]
+        
+        # Placeholder heatmap - extract coordinates from trajectories
+        all_coords = []
+        for traj_data in selected_trajs:
+            for point in traj_data:
+                # point format: (user_id, lat, lon, is_weekend, timestamp, next_timestamp)
+                lat, lon = point[1], point[2]  # Denormalize coordinates
+                all_coords.append([lat, lon])
+        
+        if all_coords:
+            coords_array = np.array(all_coords)
+            
+            # Create simple density heatmap
+            fig = go.Figure(data=go.Histogram2d(
+                x=coords_array[:, 1],  # longitude
+                y=coords_array[:, 0],  # latitude
+                colorscale='Viridis',
+                nbinsx=20,
+                nbinsy=20
+            ))
+            
+            fig.update_layout(
+                title=f"Trajectory Heatmap ({len(point_indices)} selected points)",
+                xaxis_title="Longitude",
+                yaxis_title="Latitude",
+                height=400
+            )
+        else:
+            fig = go.Figure()
+            fig.add_annotation(
+                x=0.5, y=0.5,
+                text="No trajectory data available",
+                showarrow=False,
+                xref="paper", yref="paper"
+            )
+            fig.update_layout(height=400)
+            
+        return fig
+    
+    # Callback for handling point selection info
     @app.callback(
         Output('selection-info', 'children'),
         Input('pca-scatter', 'selectedData')
