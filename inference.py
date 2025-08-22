@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from train_s2s import TrajectoryModel, TrajectoryDataset
+from train_s2s_autoencoder import TrajectoryAutoencoderModel, TrajectoryAutoencoderDataset, load_trained_autoencoder, encode_trajectory
 import pandas as pd
 from itertools import pairwise
 from sklearn.preprocessing import StandardScaler
@@ -40,35 +40,21 @@ def df_to_list(df, normalize=True):
 
 def load_best_model(checkpoint_path='best_autoencoder.pth'):
     """
-    Load the best trained model from checkpoint
+    Load the best trained autoencoder from checkpoint
     
     Args:
         checkpoint_path: Path to the saved model checkpoint
         
     Returns:
-        model: Loaded TrajectoryModel in evaluation mode
+        model: Loaded TrajectoryAutoencoderModel in evaluation mode
         checkpoint: Checkpoint dictionary with training info
     """
-    print(f"Loading model from {checkpoint_path}")
+    print(f"Loading autoencoder from {checkpoint_path}")
     
-    # Load checkpoint
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    # Use the function from train_s2s_autoencoder
+    model, checkpoint = load_trained_autoencoder(checkpoint_path)
     
-    # Create model with same architecture as training
-    # Note: Adjust these parameters to match your trained model
-    model = TrajectoryModel(
-        embedding_dim=128, 
-        hidden_dim=256, 
-        num_heads=8, 
-        num_layers=3, 
-        dropout=0.1
-    )
-    
-    # Load trained weights
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.eval()  # Set to evaluation mode
-    
-    print(f"Model loaded successfully!")
+    print(f"Autoencoder loaded successfully!")
     print(f"Training epoch: {checkpoint.get('epoch', 'Unknown')}")
     print(f"Training loss: {checkpoint.get('loss', 'Unknown'):.6f}")
     
@@ -76,108 +62,69 @@ def load_best_model(checkpoint_path='best_autoencoder.pth'):
 
 def get_trajectory_embedding(model, trajectory):
     """
-    Get spatio-temporal embedding for a new trajectory
+    Get encoder embedding for a trajectory using autoencoder
     
     Args:
-        model: Trained TrajectoryModel
+        model: Trained TrajectoryAutoencoderModel
         trajectory: List of trajectory points in format:
                    [(user_id, lat, lon, is_weekend, timestamp, next_timestamp), ...]
                    
     Returns:
-        embedding: Trajectory embedding vector of shape [hidden_dim*2]
-        attention_weights: Attention weights showing important parts
-        predicted_next_location: Model's prediction for next location
-        actual_next_location: Actual next location (if available)
+        embedding: Trajectory latent representation from encoder
+        encoder_outputs: Full encoder sequence outputs
     """
-    model.eval()
+    # Use the encode_trajectory function from train_s2s_autoencoder
+    latent_representation, encoder_outputs = encode_trajectory(model, trajectory)
     
-    with torch.no_grad():
-        # Convert trajectory to dataset format (no augmentation for inference)
-        dataset = TrajectoryDataset([trajectory], max_length=50, training=False)
-        batch = dataset[0]
-        
-        # Store actual target for comparison
-        actual_next = batch['target_coords'].clone()
-        
-        # Add batch dimension for model input
-        for key in batch:
-            if key != 'target_coords':  # Don't add batch dim to target
-                batch[key] = batch[key].unsqueeze(0)
-        
-        # Forward pass through model
-        outputs = model(batch)
-        
-        # Extract results
-        embedding = outputs['context_vector'].squeeze(0)
-        attention_weights = outputs['attention_weights'].squeeze(0)
-        predicted_next = outputs['next_location_prediction'].squeeze(0)
-        
-        return embedding, attention_weights, predicted_next, actual_next
+    return latent_representation, encoder_outputs
 
 def analyze_trajectory(model, trajectory, verbose=True):
     """
-    Comprehensive analysis of a trajectory
+    Analysis of a trajectory using autoencoder
     
     Args:
-        model: Trained TrajectoryModel
+        model: Trained TrajectoryAutoencoderModel
         trajectory: Trajectory to analyze
         verbose: Whether to print detailed analysis
         
     Returns:
         analysis: Dictionary with analysis results
     """
-    embedding, attention, predicted, actual = get_trajectory_embedding(model, trajectory)
-    
-    # Calculate prediction error
-    prediction_error = torch.norm(predicted - actual).item()
-    
-    # Get most attended positions
-    attention_np = attention.cpu().numpy().flatten()
-    top_attention_indices = np.argsort(attention_np)[-3:][::-1]  # Top 3 most attended
+    embedding, encoder_outputs = get_trajectory_embedding(model, trajectory)
     
     analysis = {
         'embedding': embedding,
         'embedding_norm': torch.norm(embedding).item(),
-        'predicted_location': predicted.tolist(),
-        'actual_location': actual.tolist(),
-        'prediction_error': prediction_error,
-        'prediction_error_km': prediction_error * 200 * 111,  # Rough conversion to km
-        'attention_weights': attention,
-        'top_attention_positions': top_attention_indices.tolist(),
+        'encoder_outputs': encoder_outputs,
         'trajectory_length': len(trajectory)
     }
     
     if verbose:
         print("\n" + "="*50)
-        print("TRAJECTORY ANALYSIS")
+        print("TRAJECTORY ANALYSIS (AUTOENCODER)")
         print("="*50)
         print(f"Trajectory length: {analysis['trajectory_length']} points")
-        print(f"Embedding dimension: {embedding.shape[0]}")
+        print(f"Latent embedding dimension: {embedding.shape[0]}")
         print(f"Embedding norm: {analysis['embedding_norm']:.4f}")
-        print(f"\nPredicted next location: [{predicted[0]:.4f}, {predicted[1]:.4f}]")
-        print(f"Actual next location:    [{actual[0]:.4f}, {actual[1]:.4f}]")
-        print(f"Prediction error: {prediction_error:.6f} (normalized)")
-        print(f"Prediction error: ~{analysis['prediction_error_km']:.1f} km")
-        print(f"\nMost attended positions: {top_attention_indices}")
         print("="*50)
     
     return analysis
 
 
 def example_usage():
-    """Example of how to use the inference functions"""
+    """Example of how to use the autoencoder inference functions"""
     def get_embedding(model):
         def foo(trajectory):
-            embedding, _, _, _ = get_trajectory_embedding(model, trajectory)
+            embedding, _ = get_trajectory_embedding(model, trajectory)
             return embedding.cpu().numpy()
         return foo
     
-    # Load the trained model
+    # Load the trained autoencoder
     try:
-        model, _ = load_best_model('best_model.pth')
+        model, _ = load_best_model('best_autoencoder.pth')
         helper_func = get_embedding(model)
     except FileNotFoundError:
-        print("Error: best_model.pth not found. Please train a model first.")
+        print("Error: best_autoencoder.pth not found. Please train an autoencoder first.")
         return
     
     # Load some sample data
@@ -213,10 +160,15 @@ def example_usage():
     # Save PCA 2D projections
     np.save('results/pca_2d.npy', pca_2d)
     
+    # Save PCA model and full results
+    with open('results/pca_results.pkl', 'wb') as f:
+        pickle.dump(pca_results, f)
+    
     print("Saved variables to results folder:")
     print(f"  - traj.pkl ({len(traj)} trajectories)")
     print(f"  - labels.pkl ({len(labels)} labels)")
     print(f"  - pca_2d.npy ({pca_2d.shape})")
+    print(f"  - pca_results.pkl (PCA model and full results)")
     
     # Plot the first two principal components
     plt.figure(figsize=(10, 8))
@@ -225,13 +177,13 @@ def example_usage():
     plt.colorbar(scatter, label='User ID')
     plt.xlabel(f'First Principal Component ({pca_results["variance_explained"][0]*100:.1f}% variance)')
     plt.ylabel(f'Second Principal Component ({pca_results["variance_explained"][1]*100:.1f}% variance)')
-    plt.title('Trajectory Embeddings - First Two Principal Components (Colored by User ID)')
+    plt.title('Autoencoder Trajectory Embeddings - PCA 2D Projection (Colored by User ID)')
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig('pca_scatter_plot.png', dpi=300, bbox_inches='tight')
+    plt.savefig('results/autoencoder_pca_scatter.png', dpi=300, bbox_inches='tight')
     plt.show()
     
-    print(f"Saved plot to pca_scatter_plot.png")
+    print(f"Saved plot to results/autoencoder_pca_scatter.png")
     print(f"First two components explain {sum(pca_results['variance_explained'][:2])*100:.1f}% of variance")
 
     
