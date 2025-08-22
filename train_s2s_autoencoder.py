@@ -39,7 +39,6 @@ class TrajectoryAutoencoderDataset(Dataset):
         """
         self.trajectories = trajectories
         self.max_length = max_length
-        self.num_users = 4000
         self.noise_std = noise_std
         self.augment_prob = augment_prob
         self.training = training    
@@ -59,7 +58,6 @@ class TrajectoryAutoencoderDataset(Dataset):
         target_traj = traj  # Same as input for reconstruction
         
         # Convert to tensors
-        user_ids = []
         coordinates = []
         timestamps = []
         
@@ -74,7 +72,6 @@ class TrajectoryAutoencoderDataset(Dataset):
         # Process input trajectory
         for point in input_traj:
             user_id, x, y, isw, timestamp, next_timestamp = point
-            user_ids.append(user_id)
             
             # Add Gaussian noise to input coordinates if augmenting
             if apply_augmentation:
@@ -96,17 +93,14 @@ class TrajectoryAutoencoderDataset(Dataset):
         
         # Pad sequences
         input_seq_len = len(input_traj)
-        pad_token = self.num_users
         
-        while len(user_ids) < self.max_length:
-            user_ids.append(pad_token)
+        while len(coordinates) < self.max_length:
             coordinates.append([1, 1])
             timestamps.append([2, 50, 50])
             target_coordinates.append([1, 1])
             target_timestamps.append([2, 50, 50])
         
         return {
-            'user_ids': torch.tensor(user_ids, dtype=torch.long),
             'coordinates': torch.tensor(coordinates, dtype=torch.float32),
             'timestamps': torch.tensor(timestamps, dtype=torch.float32),
             'target_coordinates': torch.tensor(target_coordinates, dtype=torch.float32),

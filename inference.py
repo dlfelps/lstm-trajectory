@@ -38,7 +38,7 @@ def df_to_list(df, normalize=True):
   return data
     
 
-def load_best_model(checkpoint_path='best_model.pth'):
+def load_best_model(checkpoint_path='best_autoencoder.pth'):
     """
     Load the best trained model from checkpoint
     
